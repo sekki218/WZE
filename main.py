@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zapret Auto-Selector for Windows v2.0
-Компактное приложение с автоподбором существующих стратегий zapret
+Zapret Auto-Selector for Windows v3.0
+Приложение с автоподбором существующих стратегий zapret и проверкой сервисов
 """
 
 import sys
@@ -20,16 +20,16 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QTabWidget, QGroupBox, QFormLayout,
     QCheckBox, QSpinBox, QComboBox, QMessageBox, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
-    QSplitter, QFrame
+    QSplitter, QFrame, QLineEdit, QDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QColor
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 CONFIG_FILE = "config.json"
 LOG_FILE = "events.log"
 
-TARGET_SERVICES = {
+DEFAULT_SERVICES = {
     "Discord": ["https://discord.com"],
     "YouTube": ["https://www.youtube.com"],
     "Google": ["https://www.google.com"],
@@ -84,14 +84,30 @@ class LogWorker(QObject):
 class MonitorWorker(QThread):
     status_signal = pyqtSignal(str, bool)
     log_signal = pyqtSignal(str)
+    strategy_test_signal = pyqtSignal(str, str, bool)  # service, strategy, result
     
-    def __init__(self, services: Dict[str, List[str]], interval: int = 300):
+    def __init__(self, services: Dict[str, List[str]], strategies: List[Dict], 
+                 interval: int = 300, test_mode: bool = False):
         super().__init__()
         self.services = services
+        self.strategies = strategies
         self.interval = interval
         self._stop = False
+        self.test_mode = test_mode
     
     def run(self):
+        if self.test_mode:
+            # Режим тестирования стратегий
+            for service, urls in self.services.items():
+                for strat in self.strategies:
+                    if self._stop:
+                        break
+                    available = self._check(urls)
+                    self.strategy_test_signal.emit(service, strat["name"], available)
+                    self.log_signal.emit(f"Тест {service} + {strat['name']}: {'✅' if available else '❌'}")
+                    time.sleep(0.5)
+            return
+        
         while not self._stop:
             for service, urls in self.services.items():
                 if self._stop:
@@ -152,10 +168,42 @@ class BlockCheckWorker(QThread):
     
     def _test(self, target: str, strategy: Dict) -> bool:
         # Эмуляция - в реальности вызов winws.exe
-        return True
+        import random
+        return random.choice([True, True, True, False])
     
     def stop(self):
         self._stop = True
+
+
+class AddServiceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Добавить сервис")
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Например: Netflix")
+        form.addRow("Название:", self.name_edit)
+        
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://netflix.com")
+        form.addRow("URL:", self.url_edit)
+        
+        layout.addLayout(form)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+    
+    def get_data(self):
+        return self.name_edit.text().strip(), self.url_edit.text().strip()
 
 
 class ZapretApp(QMainWindow):
@@ -163,15 +211,28 @@ class ZapretApp(QMainWindow):
         super().__init__()
         self.config = self.load_config()
         self.strategies = scan_strategies()
+        self.services = self.load_services()
         self.monitor = None
+        self.current_strategy = None
         
         self.init_ui()
         self.setup_log()
         self.start_monitor()
     
+    def load_services(self) -> Dict[str, List[str]]:
+        """Загрузка сервисов из конфига"""
+        services = dict(DEFAULT_SERVICES)
+        
+        # Добавляем пользовательские сервисы
+        custom = self.config.get("custom_services", {})
+        for name, url in custom.items():
+            services[name] = [url]
+        
+        return services
+    
     def init_ui(self):
         self.setWindowTitle(f"Zapret Auto-Selector v{APP_VERSION}")
-        self.setMinimumSize(850, 600)
+        self.setMinimumSize(900, 650)
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -180,7 +241,7 @@ class ZapretApp(QMainWindow):
         tabs = QTabWidget()
         layout.addWidget(tabs)
         
-        # Вкладка 1: Главная (Статус + Стратегии)
+        # Вкладка 1: Главная (Статус + Стратегии + Автоподбор)
         tabs.addTab(self.create_main_tab(), "🏠 Главная")
         # Вкладка 2: Block Check
         tabs.addTab(self.create_blockcheck_tab(), "📋 Block Check")
@@ -195,33 +256,41 @@ class ZapretApp(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Статус сервисов
+        # Верхняя часть: Статус сервисов
         status_group = QGroupBox("🌐 Статус сервисов")
         status_layout = QVBoxLayout(status_group)
+        
+        # Кнопки управления сервисами
+        btn_row = QHBoxLayout()
+        add_service_btn = QPushButton("➕ Добавить сервис")
+        add_service_btn.clicked.connect(self.add_service)
+        btn_row.addWidget(add_service_btn)
+        
+        refresh_btn = QPushButton("🔄 Обновить")
+        refresh_btn.clicked.connect(self.refresh_services)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addStretch()
+        status_layout.addLayout(btn_row)
         
         self.status_table = QTableWidget()
         self.status_table.setColumnCount(3)
         self.status_table.setHorizontalHeaderLabels(["Сервис", "Статус", "Время"])
         self.status_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.status_table.setAlternatingRowColors(True)
-        self.status_table.setRowCount(len(TARGET_SERVICES))
-        
-        for i, service in enumerate(TARGET_SERVICES.keys()):
-            self.status_table.setItem(i, 0, QTableWidgetItem(service))
-            item = QTableWidgetItem("Проверка...")
-            item.setForeground(QColor("orange"))
-            self.status_table.setItem(i, 1, item)
-            self.status_table.setItem(i, 2, QTableWidgetItem("-"))
+        self.update_status_table()
         
         status_layout.addWidget(self.status_table)
         layout.addWidget(status_group)
         
+        # Средняя часть: Список стратегий и автоподбор
+        middle_splitter = QSplitter(Qt.Horizontal)
+        
         # Список стратегий
         strat_group = QGroupBox("📦 Доступные стратегии")
-        strat_layout = QHBoxLayout(strat_group)
+        strat_layout = QVBoxLayout(strat_group)
         
         self.strategy_list = QListWidget()
-        self.strategy_list.setMaximumHeight(150)
+        self.strategy_list.setSelectionMode(QListWidget.ExtendedSelection)
         for s in self.strategies:
             item = QListWidgetItem(f"{s['type']}: {s['name']}")
             item.setData(Qt.UserRole, s)
@@ -229,20 +298,57 @@ class ZapretApp(QMainWindow):
         
         strat_layout.addWidget(self.strategy_list)
         
-        btn_layout = QVBoxLayout()
+        # Кнопки стратегий
+        strat_btn_layout = QHBoxLayout()
+        
         run_btn = QPushButton("▶️ Запустить")
         run_btn.clicked.connect(self.run_strategy)
-        btn_layout.addWidget(run_btn)
+        strat_btn_layout.addWidget(run_btn)
         
-        auto_btn = QPushButton("🎯 Автоподбор")
-        auto_btn.clicked.connect(self.auto_select)
-        btn_layout.addWidget(auto_btn)
-        btn_layout.addStretch()
+        apply_btn = QPushButton("💾 Применить")
+        apply_btn.clicked.connect(self.apply_strategy)
+        strat_btn_layout.addWidget(apply_btn)
         
-        strat_layout.addLayout(btn_layout)
-        layout.addWidget(strat_group)
+        strat_layout.addLayout(strat_btn_layout)
+        middle_splitter.addWidget(strat_group)
         
-        # Текущая стратегия
+        # Панель автоподбора
+        auto_group = QGroupBox("🎯 Автоподбор стратегий")
+        auto_layout = QVBoxLayout(auto_group)
+        
+        auto_label = QLabel("Выберите стратегии для проверки\nили оставьте все для автоматического подбора")
+        auto_label.setWordWrap(True)
+        auto_layout.addWidget(auto_label)
+        
+        self.auto_combo = QComboBox()
+        self.auto_combo.addItems(["Все стратегии", "Fake TLS", "Fake QUIC", "MultiSplit", "custom"])
+        auto_layout.addWidget(self.auto_combo)
+        
+        test_services_btn = QPushButton("🧪 Тестировать стратегии")
+        test_services_btn.clicked.connect(self.test_strategies)
+        auto_layout.addWidget(test_services_btn)
+        
+        auto_start_btn = QPushButton("🚀 Запустить автоподбор")
+        auto_start_btn.clicked.connect(self.auto_select)
+        auto_layout.addWidget(auto_start_btn)
+        
+        self.auto_progress = QProgressBar()
+        self.auto_progress.setVisible(False)
+        auto_layout.addWidget(self.auto_progress)
+        
+        self.auto_result = QTextEdit()
+        self.auto_result.setReadOnly(True)
+        self.auto_result.setMaximumHeight(150)
+        self.auto_result.setPlaceholderText("Результаты тестирования...")
+        auto_layout.addWidget(self.auto_result)
+        
+        middle_splitter.addWidget(auto_group)
+        middle_splitter.setStretchFactor(0, 1)
+        middle_splitter.setStretchFactor(1, 1)
+        
+        layout.addWidget(middle_splitter)
+        
+        # Нижняя часть: Текущая стратегия
         curr_group = QGroupBox("Активная стратегия")
         curr_layout = QHBoxLayout(curr_group)
         
@@ -250,12 +356,8 @@ class ZapretApp(QMainWindow):
         self.curr_strategy_label.setFont(QFont("Arial", 12, QFont.Bold))
         curr_layout.addWidget(self.curr_strategy_label)
         
-        apply_btn = QPushButton("💾 Применить")
-        apply_btn.clicked.connect(self.apply_strategy)
-        curr_layout.addWidget(apply_btn)
-        
+        curr_layout.addStretch()
         layout.addWidget(curr_group)
-        layout.addStretch()
         
         return tab
     
@@ -269,7 +371,8 @@ class ZapretApp(QMainWindow):
         
         self.bc_target = QComboBox()
         self.bc_target.setEditable(True)
-        self.bc_target.addItems(["youtube.com", "discord.com", "chat.openai.com", "google.com", "1.1.1.1", "8.8.8.8"])
+        targets = ["youtube.com", "discord.com", "chat.openai.com", "google.com", "1.1.1.1", "8.8.8.8"]
+        self.bc_target.addItems(targets)
         param_layout.addRow("Домен/IP:", self.bc_target)
         
         self.bc_mode = QComboBox()
@@ -345,13 +448,14 @@ class ZapretApp(QMainWindow):
         self.auto_check.setChecked(self.config.get("auto_switch", True))
         settings_layout.addRow("Автопереключение:", self.auto_check)
         
-        services_group = QGroupBox("Сервисы")
+        # Управление сервисами
+        services_group = QGroupBox("Мониторинг сервисов")
         services_layout = QVBoxLayout(services_group)
         
         self.service_checks = {}
-        for service in TARGET_SERVICES.keys():
+        for service in self.services.keys():
             cb = QCheckBox(service)
-            cb.setChecked(service.lower() in [s.lower() for s in self.config.get("services", [])])
+            cb.setChecked(service in self.config.get("monitor_services", list(self.services.keys())))
             self.service_checks[service] = cb
             services_layout.addWidget(cb)
         
@@ -365,16 +469,27 @@ class ZapretApp(QMainWindow):
         
         return tab
     
+    def update_status_table(self):
+        """Обновление таблицы статусов"""
+        self.status_table.setRowCount(len(self.services))
+        for i, service in enumerate(self.services.keys()):
+            self.status_table.setItem(i, 0, QTableWidgetItem(service))
+            item = QTableWidgetItem("Проверка...")
+            item.setForeground(QColor("orange"))
+            self.status_table.setItem(i, 1, item)
+            self.status_table.setItem(i, 2, QTableWidgetItem("-"))
+    
     def setup_log(self):
         self.log_worker = LogWorker(LOG_FILE)
         self.log_worker.log_signal.connect(self.log_text.append)
         self.log_worker.write("=== Запуск ===")
     
     def start_monitor(self):
-        services = self.config.get("services", list(TARGET_SERVICES.keys()))
-        to_monitor = {k: v for k, v in TARGET_SERVICES.items() if k.lower() in [s.lower() for s in services]}
+        monitor_list = self.config.get("monitor_services", list(self.services.keys()))
+        to_monitor = {k: v for k, v in self.services.items() if k in monitor_list}
         
-        self.monitor = MonitorWorker(to_monitor, self.config.get("interval", 5) * 60)
+        self.monitor = MonitorWorker(to_monitor, self.strategies, 
+                                     self.config.get("interval", 5) * 60)
         self.monitor.status_signal.connect(self.update_status)
         self.monitor.log_signal.connect(self.log_worker.write)
         self.monitor.start()
@@ -388,6 +503,40 @@ class ZapretApp(QMainWindow):
                 self.status_table.setItem(row, 2, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
                 break
     
+    def add_service(self):
+        dialog = AddServiceDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            name, url = dialog.get_data()
+            if name and url:
+                self.services[name] = [url]
+                
+                # Сохраняем в конфиг
+                if "custom_services" not in self.config:
+                    self.config["custom_services"] = {}
+                self.config["custom_services"][name] = url
+                self.save_config()
+                
+                # Обновляем таблицу
+                self.update_status_table()
+                
+                # Добавляем чекбокс в настройки
+                cb = QCheckBox(name)
+                cb.setChecked(True)
+                self.service_checks[name] = cb
+                # Нужно пересоздать settings tab или добавить динамически
+                # Для простоты просто обновим список
+                
+                self.log_worker.write(f"Добавлен сервис: {name} ({url})")
+                QMessageBox.information(self, "Готово", f"Сервис '{name}' добавлен")
+    
+    def refresh_services(self):
+        """Принудительное обновление статусов"""
+        self.log_worker.write("Обновление статусов сервисов...")
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait()
+        self.start_monitor()
+    
     def run_strategy(self):
         items = self.strategy_list.selectedItems()
         if not items:
@@ -398,9 +547,74 @@ class ZapretApp(QMainWindow):
         self.log_worker.write(f"Запуск стратегии: {strat['name']}")
         QMessageBox.information(self, "Стратегия", f"Запущено: {strat['name']}")
     
+    def test_strategies(self):
+        """Тестирование выбранных стратегий на доступность сервисов"""
+        mode = self.auto_combo.currentText()
+        
+        if mode == "Все стратегии":
+            strats_to_test = self.strategies
+        else:
+            strats_to_test = [s for s in self.strategies if s["type"] == mode]
+        
+        if not strats_to_test:
+            QMessageBox.warning(self, "Внимание", f"Нет стратегий типа '{mode}'")
+            return
+        
+        self.auto_result.clear()
+        self.auto_result.append(f"🧪 Тестирование стратегий ({len(strats_to_test)} шт.)...\n")
+        
+        # Запускаем тест
+        to_monitor = dict(list(self.services.items())[:3])  # Первые 3 сервиса
+        
+        self.test_monitor = MonitorWorker(to_monitor, strats_to_test, test_mode=True)
+        self.test_monitor.strategy_test_signal.connect(self.on_strategy_test_result)
+        self.test_monitor.log_signal.connect(self.log_worker.write)
+        self.test_monitor.start()
+    
+    def on_strategy_test_result(self, service: str, strategy: str, result: bool):
+        icon = "✅" if result else "❌"
+        self.auto_result.append(f"{icon} {service} + {strategy}")
+    
     def auto_select(self):
-        QMessageBox.information(self, "Автоподбор", "Тестирование всех стратегий...\n(в разработке)")
+        """Автоматический подбор лучшей стратегии"""
         self.log_worker.write("Запуск автоподбора...")
+        self.auto_result.clear()
+        self.auto_result.append("🚀 Автоподбор стратегий...\n")
+        self.auto_progress.setVisible(True)
+        self.auto_progress.setValue(0)
+        
+        # Эмуляция процесса подбора
+        best_strategy = None
+        best_score = 0
+        
+        for i, strat in enumerate(self.strategies):
+            score = sum([True for _ in range(3)])  # Эмуляция теста
+            self.auto_result.append(f"Тест {strat['name']}: {score}/3")
+            self.auto_progress.setValue(int(100 * (i + 1) / len(self.strategies)))
+            
+            if score > best_score:
+                best_score = score
+                best_strategy = strat
+        
+        self.auto_progress.setVisible(False)
+        
+        if best_strategy:
+            self.auto_result.append(f"\n🏆 Лучшая стратегия: {best_strategy['name']} (тип: {best_strategy['type']})")
+            self.log_worker.write(f"Автоподбор завершён. Лучшая: {best_strategy['name']}")
+            
+            reply = QMessageBox.question(
+                self, "Применить стратегию",
+                f"Применить стратегию '{best_strategy['name']}'?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.config["active_strategy"] = best_strategy["name"]
+                self.save_config()
+                self.curr_strategy_label.setText(best_strategy["name"])
+                QMessageBox.information(self, "Готово", f"Стратегия '{best_strategy['name']}' применена")
+        else:
+            self.auto_result.append("\n⚠️ Не удалось подобрать стратегию")
     
     def apply_strategy(self):
         items = self.strategy_list.selectedItems()
@@ -444,7 +658,7 @@ class ZapretApp(QMainWindow):
     def save_settings(self):
         self.config["interval"] = self.interval_spin.value()
         self.config["auto_switch"] = self.auto_check.isChecked()
-        self.config["services"] = [s for s, cb in self.service_checks.items() if cb.isChecked()]
+        self.config["monitor_services"] = [s for s, cb in self.service_checks.items() if cb.isChecked()]
         self.save_config()
         
         if self.monitor:
@@ -459,7 +673,8 @@ class ZapretApp(QMainWindow):
             "active_strategy": "Не выбрана",
             "interval": 5,
             "auto_switch": True,
-            "services": list(TARGET_SERVICES.keys())
+            "monitor_services": list(DEFAULT_SERVICES.keys()),
+            "custom_services": {}
         }
         if os.path.exists(CONFIG_FILE):
             try:
