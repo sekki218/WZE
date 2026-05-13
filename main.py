@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zapret Auto-Selector for Windows
-Готовое Windows-приложение с автоматическим подбором стратегий из zapret
+Zapret Auto-Selector for Windows v2.0
+Компактное приложение с автоподбором существующих стратегий zapret
 """
 
 import sys
@@ -13,625 +13,483 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QTabWidget, QGroupBox, QFormLayout,
     QCheckBox, QSpinBox, QComboBox, QMessageBox, QProgressBar,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QFrame
+    QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
+    QSplitter, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QColor, QIcon
+from PyQt6.QtGui import QFont, QColor
 
-# Constants
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 CONFIG_FILE = "config.json"
 LOG_FILE = "events.log"
-CHECK_INTERVAL_DEFAULT = 5  # minutes
 
-# Target services from utils/targets.txt
 TARGET_SERVICES = {
-    "Discord": ["https://discord.com", "https://gateway.discord.gg"],
-    "YouTube": ["https://www.youtube.com", "https://youtu.be"],
-    "Google": ["https://www.google.com", "https://www.gstatic.com"],
+    "Discord": ["https://discord.com"],
+    "YouTube": ["https://www.youtube.com"],
+    "Google": ["https://www.google.com"],
     "Cloudflare": ["https://www.cloudflare.com"],
     "ChatGPT": ["https://chat.openai.com"],
 }
 
 
+def scan_strategies() -> List[Dict]:
+    """Сканирование существующих .bat файлов как стратегий"""
+    strategies = []
+    bat_dir = Path(__file__).parent
+    
+    for bat_file in sorted(bat_dir.glob("*.bat")):
+        if bat_file.name == "service.bat":
+            continue
+        
+        name = bat_file.stem.replace("general ", "").replace("(", "").replace(")", "").strip()
+        stype = "custom"
+        try:
+            with open(bat_file, "r", encoding="utf-8") as f:
+                content = f.read().lower()
+                if "fake" in content and "tls" in content:
+                    stype = "Fake TLS"
+                elif "fake" in content and "quic" in content:
+                    stype = "Fake QUIC"
+                elif "multisplit" in content:
+                    stype = "MultiSplit"
+        except:
+            pass
+        
+        strategies.append({"name": name, "file": bat_file.name, "type": stype})
+    
+    return strategies
+
+
 class LogWorker(QObject):
-    """Worker для записи логов в файл"""
     log_signal = pyqtSignal(str)
     
     def __init__(self, log_file: str):
         super().__init__()
         self.log_file = log_file
     
-    def write_log(self, message: str, level: str = "INFO"):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = f"[{timestamp}] [{level}] {message}\n"
-        
+    def write(self, message: str, level: str = "INFO"):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{ts}] [{level}] {message}\n"
         with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-        
-        self.log_signal.emit(log_entry.strip())
+            f.write(entry)
+        self.log_signal.emit(entry.strip())
+
+
+class MonitorWorker(QThread):
+    status_signal = pyqtSignal(str, bool)
+    log_signal = pyqtSignal(str)
+    
+    def __init__(self, services: Dict[str, List[str]], interval: int = 300):
+        super().__init__()
+        self.services = services
+        self.interval = interval
+        self._stop = False
+    
+    def run(self):
+        while not self._stop:
+            for service, urls in self.services.items():
+                if self._stop:
+                    break
+                available = self._check(urls)
+                self.status_signal.emit(service, available)
+                self.log_signal.emit(f"{'✅' if available else '⚠️'} {service}")
+            
+            for _ in range(self.interval):
+                if self._stop:
+                    break
+                time.sleep(1)
+    
+    def _check(self, urls: List[str]) -> bool:
+        try:
+            import requests
+            for url in urls:
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    return True
+            return False
+        except:
+            return False
+    
+    def stop(self):
+        self._stop = True
 
 
 class BlockCheckWorker(QThread):
-    """Worker для многопоточного blockcheck"""
     progress_signal = pyqtSignal(int)
-    result_signal = pyqtSignal(str, bool, str)  # target, success, strategy
+    result_signal = pyqtSignal(str, bool, str)
     finished_signal = pyqtSignal()
     
-    def __init__(self, targets: List[str], strategies: List[str]):
+    def __init__(self, targets: List[str], strategies: List[Dict]):
         super().__init__()
         self.targets = targets
         self.strategies = strategies
-        self._stop_flag = False
+        self._stop = False
     
     def run(self):
-        """Запуск проверки по всем целям и стратегиям"""
         total = len(self.targets) * len(self.strategies)
         current = 0
         
         for target in self.targets:
-            if self._stop_flag:
+            if self._stop:
                 break
-                
-            for strategy in self.strategies:
-                if self._stop_flag:
+            for strat in self.strategies:
+                if self._stop:
                     break
                 
-                # Эмуляция проверки (в реальности здесь вызов winws.exe)
-                success = self._check_target(target, strategy)
-                self.result_signal.emit(target, success, strategy)
-                
+                success = self._test(target, strat)
+                self.result_signal.emit(target, success, strat["name"])
                 current += 1
                 self.progress_signal.emit(int(100 * current / total))
-                time.sleep(0.1)  # Небольшая задержка между проверками
+                time.sleep(0.05)
         
         self.finished_signal.emit()
     
-    def _check_target(self, target: str, strategy: str) -> bool:
-        """Проверка доступности цели с указанной стратегией"""
-        try:
-            # Здесь будет реальный вызов zapret
-            # Для примера - эмуляция
-            return True
-        except Exception as e:
-            return False
+    def _test(self, target: str, strategy: Dict) -> bool:
+        # Эмуляция - в реальности вызов winws.exe
+        return True
     
     def stop(self):
-        self._stop_flag = True
+        self._stop = True
 
 
-class MonitorWorker(QThread):
-    """Worker для мониторинга доступности сервисов"""
-    status_signal = pyqtSignal(str, bool)  # service, is_available
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    
-    def __init__(self, services: Dict[str, List[str]]):
-        super().__init__()
-        self.services = services
-        self._stop_flag = False
-    
-    def run(self):
-        """Цикл мониторинга"""
-        while not self._stop_flag:
-            for service, urls in self.services.items():
-                if self._stop_flag:
-                    break
-                
-                is_available = self._check_service(service, urls)
-                self.status_signal.emit(service, is_available)
-                
-                if is_available:
-                    self.log_signal.emit(f"✅ {service} доступен")
-                else:
-                    self.log_signal.emit(f"⚠️ {service} недоступен")
-            
-            # Проверка каждые 5 минут (300 секунд)
-            for _ in range(300):
-                if self._stop_flag:
-                    break
-                time.sleep(1)
-        
-        self.finished_signal.emit()
-    
-    def _check_service(self, service: str, urls: List[str]) -> bool:
-        """Проверка доступности сервиса"""
-        try:
-            import requests
-            for url in urls:
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    return True
-            return False
-        except Exception:
-            return False
-    
-    def stop(self):
-        self._stop_flag = True
-
-
-class StrategySelectorWindow(QMainWindow):
-    """Главное окно приложения"""
-    
+class ZapretApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = self.load_config()
-        self.log_worker = None
-        self.monitor_worker = None
-        self.blockcheck_worker = None
+        self.strategies = scan_strategies()
+        self.monitor = None
         
         self.init_ui()
-        self.setup_logging()
-        self.start_monitoring()
+        self.setup_log()
+        self.start_monitor()
     
     def init_ui(self):
-        """Инициализация пользовательского интерфейса"""
         self.setWindowTitle(f"Zapret Auto-Selector v{APP_VERSION}")
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(850, 600)
         
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
         
-        # Tabs
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
         
-        # Create tabs
-        self.create_status_tab()
-        self.create_auto_select_tab()
-        self.create_blockcheck_tab()
-        self.create_log_tab()
-        self.create_settings_tab()
+        # Вкладка 1: Главная (Статус + Стратегии)
+        tabs.addTab(self.create_main_tab(), "🏠 Главная")
+        # Вкладка 2: Block Check
+        tabs.addTab(self.create_blockcheck_tab(), "📋 Block Check")
+        # Вкладка 3: Журнал
+        tabs.addTab(self.create_log_tab(), "📝 Журнал")
+        # Вкладка 4: Настройки
+        tabs.addTab(self.create_settings_tab(), "⚙️ Настройки")
         
-        # Status bar
-        self.statusBar().showMessage("Готов к работе")
+        self.statusBar().showMessage("Готов")
     
-    def create_status_tab(self):
-        """Вкладка статуса сервисов"""
+    def create_main_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Group box for services
-        group = QGroupBox("Статус сервисов")
-        group_layout = QVBoxLayout(group)
+        # Статус сервисов
+        status_group = QGroupBox("🌐 Статус сервисов")
+        status_layout = QVBoxLayout(status_group)
         
-        # Table for services
         self.status_table = QTableWidget()
         self.status_table.setColumnCount(3)
-        self.status_table.setHorizontalHeaderLabels(["Сервис", "Статус", "Последняя проверка"])
-        self.status_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.status_table.setHorizontalHeaderLabels(["Сервис", "Статус", "Время"])
+        self.status_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.status_table.setAlternatingRowColors(True)
-        
-        # Add services to table
         self.status_table.setRowCount(len(TARGET_SERVICES))
-        for i, (service, urls) in enumerate(TARGET_SERVICES.items()):
+        
+        for i, service in enumerate(TARGET_SERVICES.keys()):
             self.status_table.setItem(i, 0, QTableWidgetItem(service))
-            
-            status_item = QTableWidgetItem("Проверка...")
-            status_item.setForeground(QColor("orange"))
-            self.status_table.setItem(i, 1, status_item)
-            
+            item = QTableWidgetItem("Проверка...")
+            item.setForeground(QColor("orange"))
+            self.status_table.setItem(i, 1, item)
             self.status_table.setItem(i, 2, QTableWidgetItem("-"))
         
-        group_layout.addWidget(self.status_table)
-        layout.addWidget(group)
+        status_layout.addWidget(self.status_table)
+        layout.addWidget(status_group)
         
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Обновить статус")
-        refresh_btn.clicked.connect(self.refresh_status)
-        layout.addWidget(refresh_btn)
+        # Список стратегий
+        strat_group = QGroupBox("📦 Доступные стратегии")
+        strat_layout = QHBoxLayout(strat_group)
         
-        self.tabs.addTab(tab, "📊 Статус")
-    
-    def create_auto_select_tab(self):
-        """Вкладка автоподбора стратегий"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+        self.strategy_list = QListWidget()
+        self.strategy_list.setMaximumHeight(150)
+        for s in self.strategies:
+            item = QListWidgetItem(f"{s['type']}: {s['name']}")
+            item.setData(Qt.UserRole, s)
+            self.strategy_list.addItem(item)
         
-        # Info label
-        info_label = QLabel(
-            "Автоматический подбор оптимальной стратегии zapret для вашего соединения.\n"
-            "Приложение протестирует доступные стратегии и выберет лучшую."
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
+        strat_layout.addWidget(self.strategy_list)
         
-        # Progress
-        self.auto_progress = QProgressBar()
-        self.auto_progress.setVisible(False)
-        layout.addWidget(self.auto_progress)
+        btn_layout = QVBoxLayout()
+        run_btn = QPushButton("▶️ Запустить")
+        run_btn.clicked.connect(self.run_strategy)
+        btn_layout.addWidget(run_btn)
         
-        # Start button
-        self.auto_start_btn = QPushButton("▶️ Запустить автоподбор")
-        self.auto_start_btn.clicked.connect(self.start_auto_select)
-        layout.addWidget(self.auto_start_btn)
+        auto_btn = QPushButton("🎯 Автоподбор")
+        auto_btn.clicked.connect(self.auto_select)
+        btn_layout.addWidget(auto_btn)
+        btn_layout.addStretch()
         
-        # Results
-        results_group = QGroupBox("Результаты подбора")
-        results_layout = QVBoxLayout(results_group)
+        strat_layout.addLayout(btn_layout)
+        layout.addWidget(strat_group)
         
-        self.results_text = QTextEdit()
-        self.results_text.setReadOnly(True)
-        self.results_text.setMaximumHeight(200)
-        results_layout.addWidget(self.results_text)
+        # Текущая стратегия
+        curr_group = QGroupBox("Активная стратегия")
+        curr_layout = QHBoxLayout(curr_group)
         
-        layout.addWidget(results_group)
+        self.curr_strategy_label = QLabel(self.config.get("active_strategy", "Не выбрана"))
+        self.curr_strategy_label.setFont(QFont("Arial", 12, QFont.Bold))
+        curr_layout.addWidget(self.curr_strategy_label)
         
-        # Current strategy
-        strategy_group = QGroupBox("Текущая стратегия")
-        strategy_layout = QFormLayout(strategy_group)
-        
-        self.current_strategy_label = QLabel(self.config.get("selected_strategy", "auto"))
-        strategy_layout.addRow("Стратегия:", self.current_strategy_label)
-        
-        apply_btn = QPushButton("💾 Применить стратегию")
+        apply_btn = QPushButton("💾 Применить")
         apply_btn.clicked.connect(self.apply_strategy)
-        strategy_layout.addRow("", apply_btn)
+        curr_layout.addWidget(apply_btn)
         
-        layout.addWidget(strategy_group)
-        
+        layout.addWidget(curr_group)
         layout.addStretch()
         
-        self.tabs.addTab(tab, "🎯 Автоподбор")
+        return tab
     
-    def create_blockcheck_tab(self):
-        """Вкладка Domain/IP Block Check"""
+    def create_blockcheck_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Input section
-        input_group = QGroupBox("Параметры проверки")
-        input_layout = QFormLayout(input_group)
+        # Параметры
+        param_group = QGroupBox("Параметры проверки")
+        param_layout = QFormLayout(param_group)
         
-        # Target input
-        self.blockcheck_target = QComboBox()
-        self.blockcheck_target.setEditable(True)
-        self.blockcheck_target.addItems([
-            "youtube.com",
-            "discord.com",
-            "chat.openai.com",
-            "google.com",
-            "1.1.1.1",
-            "8.8.8.8"
-        ])
-        input_layout.addRow("Домен/IP:", self.blockcheck_target)
+        self.bc_target = QComboBox()
+        self.bc_target.setEditable(True)
+        self.bc_target.addItems(["youtube.com", "discord.com", "chat.openai.com", "google.com", "1.1.1.1", "8.8.8.8"])
+        param_layout.addRow("Домен/IP:", self.bc_target)
         
-        # Strategy selection
-        self.blockcheck_strategy = QComboBox()
-        self.blockcheck_strategy.addItems([
-            "Все стратегии",
-            "Fake TLS",
-            "Fake QUIC",
-            "Host Spoofing",
-            "Custom"
-        ])
-        input_layout.addRow("Стратегия:", self.blockcheck_strategy)
+        self.bc_mode = QComboBox()
+        self.bc_mode.addItems(["Все стратегии", "Fake TLS", "Fake QUIC", "MultiSplit"])
+        param_layout.addRow("Режим:", self.bc_mode)
         
-        # Threads
-        self.blockcheck_threads = QSpinBox()
-        self.blockcheck_threads.setRange(1, 16)
-        self.blockcheck_threads.setValue(4)
-        input_layout.addRow("Потоков:", self.blockcheck_threads)
+        self.bc_threads = QSpinBox()
+        self.bc_threads.setRange(1, 16)
+        self.bc_threads.setValue(4)
+        param_layout.addRow("Потоков:", self.bc_threads)
         
-        layout.addWidget(input_group)
+        layout.addWidget(param_group)
         
-        # Start button
         start_btn = QPushButton("🔍 Запустить проверку")
-        start_btn.clicked.connect(self.start_blockcheck)
+        start_btn.clicked.connect(self.run_blockcheck)
         layout.addWidget(start_btn)
         
-        # Progress
-        self.blockcheck_progress = QProgressBar()
-        self.blockcheck_progress.setVisible(False)
-        layout.addWidget(self.blockcheck_progress)
+        self.bc_progress = QProgressBar()
+        self.bc_progress.setVisible(False)
+        layout.addWidget(self.bc_progress)
         
-        # Results
-        results_group = QGroupBox("Результаты проверки")
-        results_layout = QVBoxLayout(results_group)
+        # Результаты
+        res_group = QGroupBox("Результаты")
+        res_layout = QVBoxLayout(res_group)
         
-        self.blockcheck_results = QTextEdit()
-        self.blockcheck_results.setReadOnly(True)
-        results_layout.addWidget(self.blockcheck_results)
+        self.bc_results = QTextEdit()
+        self.bc_results.setReadOnly(True)
+        self.bc_results.setMaximumHeight(200)
+        res_layout.addWidget(self.bc_results)
         
-        layout.addWidget(results_group)
+        layout.addWidget(res_group)
+        layout.addStretch()
         
-        self.tabs.addTab(tab, "📋 Block Check")
+        return tab
     
-    def create_log_tab(self):
-        """Вкладка журнала событий"""
+    def create_log_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Log text area
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 9))
         layout.addWidget(self.log_text)
         
-        # Buttons
         btn_layout = QHBoxLayout()
         
-        clear_btn = QPushButton("🗑️ Очистить журнал")
-        clear_btn.clicked.connect(self.clear_log)
+        clear_btn = QPushButton("🗑️ Очистить")
+        clear_btn.clicked.connect(lambda: self.log_text.clear())
         btn_layout.addWidget(clear_btn)
         
-        export_btn = QPushButton("💾 Экспорт журнала")
+        export_btn = QPushButton("💾 Экспорт")
         export_btn.clicked.connect(self.export_log)
         btn_layout.addWidget(export_btn)
         
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
-        self.tabs.addTab(tab, "📝 Журнал")
+        return tab
     
-    def create_settings_tab(self):
-        """Вкладка настроек"""
+    def create_settings_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Settings form
-        settings_group = QGroupBox("Основные настройки")
+        settings_group = QGroupBox("Настройки")
         settings_layout = QFormLayout(settings_group)
         
-        # Check interval
-        self.check_interval_spin = QSpinBox()
-        self.check_interval_spin.setRange(1, 60)
-        self.check_interval_spin.setValue(self.config.get("check_interval_minutes", CHECK_INTERVAL_DEFAULT))
-        settings_layout.addRow("Интервал проверки (мин):", self.check_interval_spin)
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 60)
+        self.interval_spin.setValue(self.config.get("interval", 5))
+        settings_layout.addRow("Интервал (мин):", self.interval_spin)
         
-        # Auto switch
-        self.auto_switch_check = QCheckBox()
-        self.auto_switch_check.setChecked(self.config.get("auto_switch_enabled", True))
-        settings_layout.addRow("Автопереключение:", self.auto_switch_check)
+        self.auto_check = QCheckBox()
+        self.auto_check.setChecked(self.config.get("auto_switch", True))
+        settings_layout.addRow("Автопереключение:", self.auto_check)
         
-        # Monitored services
-        services_group = QGroupBox("Мониторируемые сервисы")
+        services_group = QGroupBox("Сервисы")
         services_layout = QVBoxLayout(services_group)
         
         self.service_checks = {}
         for service in TARGET_SERVICES.keys():
-            check = QCheckBox(service)
-            check.setChecked(service.lower() in [s.lower() for s in self.config.get("monitored_services", [])])
-            self.service_checks[service] = check
-            services_layout.addWidget(check)
+            cb = QCheckBox(service)
+            cb.setChecked(service.lower() in [s.lower() for s in self.config.get("services", [])])
+            self.service_checks[service] = cb
+            services_layout.addWidget(cb)
         
         settings_layout.addRow("", services_group)
-        
         layout.addWidget(settings_group)
         
-        # Save button
-        save_btn = QPushButton("💾 Сохранить настройки")
+        save_btn = QPushButton("💾 Сохранить")
         save_btn.clicked.connect(self.save_settings)
         layout.addWidget(save_btn)
-        
         layout.addStretch()
         
-        self.tabs.addTab(tab, "⚙️ Настройки")
+        return tab
     
-    def setup_logging(self):
-        """Настройка логирования"""
+    def setup_log(self):
         self.log_worker = LogWorker(LOG_FILE)
-        self.log_worker.log_signal.connect(self.append_log)
-        self.append_log("=== Приложение запущено ===")
+        self.log_worker.log_signal.connect(self.log_text.append)
+        self.log_worker.write("=== Запуск ===")
     
-    def append_log(self, message: str):
-        """Добавление записи в журнал"""
-        self.log_text.append(message)
-        # Auto-scroll to bottom
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-    
-    def clear_log(self):
-        """Очистка журнала"""
-        self.log_text.clear()
-        self.append_log("Журнал очищен")
-    
-    def export_log(self):
-        """Экспорт журнала"""
-        try:
-            with open("exported_log.txt", "w", encoding="utf-8") as f:
-                f.write(self.log_text.toPlainText())
-            QMessageBox.information(self, "Экспорт", "Журнал экспортирован в exported_log.txt")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось экспортировать журнал: {e}")
-    
-    def start_monitoring(self):
-        """Запуск мониторинга сервисов"""
-        monitored = self.config.get("monitored_services", list(TARGET_SERVICES.keys()))
-        services_to_monitor = {
-            k: v for k, v in TARGET_SERVICES.items()
-            if k.lower() in [s.lower() for s in monitored]
-        }
+    def start_monitor(self):
+        services = self.config.get("services", list(TARGET_SERVICES.keys()))
+        to_monitor = {k: v for k, v in TARGET_SERVICES.items() if k.lower() in [s.lower() for s in services]}
         
-        self.monitor_worker = MonitorWorker(services_to_monitor)
-        self.monitor_worker.status_signal.connect(self.update_service_status)
-        self.monitor_worker.log_signal.connect(self.append_log)
-        self.monitor_worker.start()
-        
-        self.append_log("Мониторинг запущен")
+        self.monitor = MonitorWorker(to_monitor, self.config.get("interval", 5) * 60)
+        self.monitor.status_signal.connect(self.update_status)
+        self.monitor.log_signal.connect(self.log_worker.write)
+        self.monitor.start()
     
-    def update_service_status(self, service: str, is_available: bool):
-        """Обновление статуса сервиса в таблице"""
+    def update_status(self, service: str, available: bool):
         for row in range(self.status_table.rowCount()):
             if self.status_table.item(row, 0).text() == service:
-                status_item = self.status_table.item(row, 1)
-                if is_available:
-                    status_item.setText("✅ Доступен")
-                    status_item.setForeground(QColor("green"))
-                else:
-                    status_item.setText("❌ Недоступен")
-                    status_item.setForeground(QColor("red"))
-                
-                # Update last check time
-                now = datetime.now().strftime("%H:%M:%S")
-                self.status_table.setItem(row, 2, QTableWidgetItem(now))
+                item = self.status_table.item(row, 1)
+                item.setText("✅ OK" if available else "❌ FAIL")
+                item.setForeground(QColor("green" if available else "red"))
+                self.status_table.setItem(row, 2, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
                 break
     
-    def refresh_status(self):
-        """Принудительное обновление статуса"""
-        self.append_log("Принудительное обновление статуса...")
-        # В реальной реализации здесь будет вызов проверки
+    def run_strategy(self):
+        items = self.strategy_list.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "Внимание", "Выберите стратегию")
+            return
+        
+        strat = items[0].data(Qt.UserRole)
+        self.log_worker.write(f"Запуск стратегии: {strat['name']}")
+        QMessageBox.information(self, "Стратегия", f"Запущено: {strat['name']}")
     
-    def start_auto_select(self):
-        """Запуск автоподбора стратегий"""
-        self.auto_start_btn.setEnabled(False)
-        self.auto_progress.setVisible(True)
-        self.auto_progress.setValue(0)
-        
-        self.append_log("Запуск автоподбора стратегий...")
-        self.results_text.clear()
-        
-        # Эмуляция процесса подбора
-        strategies = ["Fake TLS", "Fake QUIC", "Host Spoofing"]
-        targets = list(TARGET_SERVICES.keys())
-        
-        self.blockcheck_worker = BlockCheckWorker(targets, strategies)
-        self.blockcheck_worker.progress_signal.connect(self.auto_progress.setValue)
-        self.blockcheck_worker.result_signal.connect(self.handle_blockcheck_result)
-        self.blockcheck_worker.finished_signal.connect(self.auto_select_finished)
-        self.blockcheck_worker.start()
-    
-    def handle_blockcheck_result(self, target: str, success: bool, strategy: str):
-        """Обработка результата проверки"""
-        status = "✅" if success else "❌"
-        self.results_text.append(f"{status} {target} - {strategy}: {'Успех' if success else 'Неудача'}")
-    
-    def auto_select_finished(self):
-        """Завершение автоподбора"""
-        self.auto_progress.setVisible(False)
-        self.auto_start_btn.setEnabled(True)
-        self.append_log("Автоподбор завершён")
-        
-        # Определение лучшей стратегии (в реальности - анализ результатов)
-        best_strategy = "Fake TLS"
-        self.config["selected_strategy"] = best_strategy
-        self.current_strategy_label.setText(best_strategy)
-        
-        QMessageBox.information(
-            self,
-            "Автоподбор завершён",
-            f"Лучшая стратегия: {best_strategy}\n\nСтратегия применена автоматически."
-        )
+    def auto_select(self):
+        QMessageBox.information(self, "Автоподбор", "Тестирование всех стратегий...\n(в разработке)")
+        self.log_worker.write("Запуск автоподбора...")
     
     def apply_strategy(self):
-        """Применение выбранной стратегии"""
-        strategy = self.current_strategy_label.text()
-        self.append_log(f"Применение стратегии: {strategy}")
+        items = self.strategy_list.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "Внимание", "Выберите стратегию")
+            return
         
-        # В реальной реализации здесь будет вызов zapret с нужной стратегией
-        QMessageBox.information(self, "Стратегия", f"Стратегия '{strategy}' применена")
+        strat = items[0].data(Qt.UserRole)
+        self.config["active_strategy"] = strat["name"]
+        self.save_config()
+        self.curr_strategy_label.setText(strat["name"])
+        self.log_worker.write(f"Применена стратегия: {strat['name']}")
+        QMessageBox.information(self, "Готово", f"Стратегия '{strat['name']}' применена")
     
-    def start_blockcheck(self):
-        """Запуск Block Check"""
-        target = self.blockcheck_target.currentText()
-        strategy = self.blockcheck_strategy.currentText()
-        threads = self.blockcheck_threads.value()
+    def run_blockcheck(self):
+        target = self.bc_target.currentText()
+        mode = self.bc_mode.currentText()
+        threads = self.bc_threads.value()
         
-        self.append_log(f"Запуск проверки: {target} (стратегия: {strategy}, потоков: {threads})")
+        self.log_worker.write(f"BlockCheck: {target} ({mode}, {threads} потоков)")
+        self.bc_results.clear()
+        self.bc_progress.setVisible(True)
+        self.bc_progress.setValue(0)
         
-        self.blockcheck_results.clear()
-        self.blockcheck_progress.setVisible(True)
-        self.blockcheck_progress.setValue(0)
+        strats = self.strategies if mode == "Все стратегии" else [s for s in self.strategies if s["type"] == mode]
         
-        # Эмуляция проверки
-        strategies_to_test = ["Все стратегии"] if strategy == "Все стратегии" else [strategy]
-        
-        self.blockcheck_worker = BlockCheckWorker([target], strategies_to_test)
-        self.blockcheck_worker.progress_signal.connect(self.blockcheck_progress.setValue)
-        self.blockcheck_worker.result_signal.connect(
-            lambda t, s, strat: self.blockcheck_results.append(
-                f"{'✅' if s else '❌'} {t} - {strat}: {'Доступно' if s else 'Заблокировано'}"
-            )
-        )
-        self.blockcheck_worker.finished_signal.connect(self.blockcheck_finished)
-        self.blockcheck_worker.start()
+        self.bc_worker = BlockCheckWorker([target], strats)
+        self.bc_worker.progress_signal.connect(self.bc_progress.setValue)
+        self.bc_worker.result_signal.connect(lambda t, s, st: self.bc_results.append(f"{'✅' if s else '❌'} {t} - {st}"))
+        self.bc_worker.finished_signal.connect(lambda: self.bc_progress.setVisible(False))
+        self.bc_worker.start()
     
-    def blockcheck_finished(self):
-        """Завершение Block Check"""
-        self.blockcheck_progress.setVisible(False)
-        self.append_log("Проверка завершена")
+    def export_log(self):
+        try:
+            with open("log_export.txt", "w", encoding="utf-8") as f:
+                f.write(self.log_text.toPlainText())
+            QMessageBox.information(self, "Экспорт", "Журнал экспортирован в log_export.txt")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
     
     def save_settings(self):
-        """Сохранение настроек"""
-        self.config["check_interval_minutes"] = self.check_interval_spin.value()
-        self.config["auto_switch_enabled"] = self.auto_switch_check.isChecked()
-        
-        monitored = [
-            service for service, check in self.service_checks.items()
-            if check.isChecked()
-        ]
-        self.config["monitored_services"] = monitored
-        
+        self.config["interval"] = self.interval_spin.value()
+        self.config["auto_switch"] = self.auto_check.isChecked()
+        self.config["services"] = [s for s, cb in self.service_checks.items() if cb.isChecked()]
         self.save_config()
-        QMessageBox.information(self, "Настройки", "Настройки сохранены")
-        self.append_log("Настройки сохранены")
         
-        # Перезапуск мониторинга с новыми настройками
-        if self.monitor_worker:
-            self.monitor_worker.stop()
-            self.monitor_worker.wait()
-        self.start_monitoring()
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait()
+        self.start_monitor()
+        
+        QMessageBox.information(self, "Готово", "Настройки сохранены")
     
     def load_config(self) -> dict:
-        """Загрузка конфигурации"""
-        default_config = {
-            "selected_strategy": "auto",
-            "check_interval_minutes": CHECK_INTERVAL_DEFAULT,
-            "auto_switch_enabled": True,
-            "monitored_services": list(TARGET_SERVICES.keys()),
-            "custom_strategies": []
+        default = {
+            "active_strategy": "Не выбрана",
+            "interval": 5,
+            "auto_switch": True,
+            "services": list(TARGET_SERVICES.keys())
         }
-        
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                    default_config.update(config)
-            except Exception as e:
-                print(f"Error loading config: {e}")
-        
-        return default_config
+                    cfg = json.load(f)
+                    default.update(cfg)
+            except:
+                pass
+        return default
     
     def save_config(self):
-        """Сохранение конфигурации"""
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=4, ensure_ascii=False)
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
+            QMessageBox.critical(self, "Ошибка", str(e))
     
     def closeEvent(self, event):
-        """Обработка закрытия приложения"""
-        if self.monitor_worker:
-            self.monitor_worker.stop()
-            self.monitor_worker.wait()
-        
-        if self.blockcheck_worker:
-            self.blockcheck_worker.stop()
-            self.blockcheck_worker.wait()
-        
-        self.append_log("=== Приложение закрыто ===")
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait()
+        self.log_worker.write("=== Завершение ===")
         event.accept()
 
 
 def main():
-    """Точка входа приложения"""
     app = QApplication(sys.argv)
-    
-    # Set application style
     app.setStyle("Fusion")
-    
-    window = StrategySelectorWindow()
+    window = ZapretApp()
     window.show()
-    
     sys.exit(app.exec())
 
 
